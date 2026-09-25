@@ -10,33 +10,89 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiV1MarketAssetsRouteImport } from './routes/api/v1/market/assets'
+import { Route as ApiV1MarketHistoryRouteImport } from './routes/api/v1/market/history'
+import { Route as ApiV1MarketOverviewRouteImport } from './routes/api/v1/market/overview'
+import { Route as ApiV1MarketRegimeRouteImport } from './routes/api/v1/market/regime'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiV1MarketAssetsRoute = ApiV1MarketAssetsRouteImport.update({
+  id: '/api/v1/market/assets',
+  path: '/api/v1/market/assets',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiV1MarketHistoryRoute = ApiV1MarketHistoryRouteImport.update({
+  id: '/api/v1/market/history',
+  path: '/api/v1/market/history',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiV1MarketOverviewRoute = ApiV1MarketOverviewRouteImport.update({
+  id: '/api/v1/market/overview',
+  path: '/api/v1/market/overview',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiV1MarketRegimeRoute = ApiV1MarketRegimeRouteImport.update({
+  id: '/api/v1/market/regime',
+  path: '/api/v1/market/regime',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/api/v1/market/assets': typeof ApiV1MarketAssetsRoute
+  '/api/v1/market/history': typeof ApiV1MarketHistoryRoute
+  '/api/v1/market/overview': typeof ApiV1MarketOverviewRoute
+  '/api/v1/market/regime': typeof ApiV1MarketRegimeRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/api/v1/market/assets': typeof ApiV1MarketAssetsRoute
+  '/api/v1/market/history': typeof ApiV1MarketHistoryRoute
+  '/api/v1/market/overview': typeof ApiV1MarketOverviewRoute
+  '/api/v1/market/regime': typeof ApiV1MarketRegimeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/api/v1/market/assets': typeof ApiV1MarketAssetsRoute
+  '/api/v1/market/history': typeof ApiV1MarketHistoryRoute
+  '/api/v1/market/overview': typeof ApiV1MarketOverviewRoute
+  '/api/v1/market/regime': typeof ApiV1MarketRegimeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/api/v1/market/assets'
+    | '/api/v1/market/history'
+    | '/api/v1/market/overview'
+    | '/api/v1/market/regime'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/api/v1/market/assets'
+    | '/api/v1/market/history'
+    | '/api/v1/market/overview'
+    | '/api/v1/market/regime'
+  id:
+    | '__root__'
+    | '/'
+    | '/api/v1/market/assets'
+    | '/api/v1/market/history'
+    | '/api/v1/market/overview'
+    | '/api/v1/market/regime'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ApiV1MarketAssetsRoute: typeof ApiV1MarketAssetsRoute
+  ApiV1MarketHistoryRoute: typeof ApiV1MarketHistoryRoute
+  ApiV1MarketOverviewRoute: typeof ApiV1MarketOverviewRoute
+  ApiV1MarketRegimeRoute: typeof ApiV1MarketRegimeRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +104,43 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/v1/market/assets': {
+      id: '/api/v1/market/assets'
+      path: '/api/v1/market/assets'
+      fullPath: '/api/v1/market/assets'
+      preLoaderRoute: typeof ApiV1MarketAssetsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/market/history': {
+      id: '/api/v1/market/history'
+      path: '/api/v1/market/history'
+      fullPath: '/api/v1/market/history'
+      preLoaderRoute: typeof ApiV1MarketHistoryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/market/overview': {
+      id: '/api/v1/market/overview'
+      path: '/api/v1/market/overview'
+      fullPath: '/api/v1/market/overview'
+      preLoaderRoute: typeof ApiV1MarketOverviewRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/market/regime': {
+      id: '/api/v1/market/regime'
+      path: '/api/v1/market/regime'
+      fullPath: '/api/v1/market/regime'
+      preLoaderRoute: typeof ApiV1MarketRegimeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ApiV1MarketAssetsRoute: ApiV1MarketAssetsRoute,
+  ApiV1MarketHistoryRoute: ApiV1MarketHistoryRoute,
+  ApiV1MarketOverviewRoute: ApiV1MarketOverviewRoute,
+  ApiV1MarketRegimeRoute: ApiV1MarketRegimeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
