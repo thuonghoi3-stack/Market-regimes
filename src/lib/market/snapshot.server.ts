@@ -6,6 +6,7 @@ import { persistMarketSnapshot } from "./persistence.server";
 
 const BINANCE_FUTURES = "https://fapi.binance.com";
 const BYBIT = "https://api.bybit.com";
+const OKX = "https://www.okx.com";
 const CACHE_TTL_MS = 60_000;
 const FOUR_H_LIMIT = 500;
 const FIVE_M_LIMIT = 320;
@@ -22,6 +23,9 @@ type MarketSource = {
 type BybitResponse<T> = { retCode: number; retMsg: string; result?: T };
 type BybitKlines = { list?: string[][] };
 type BybitTickers = { list?: Array<{ symbol: string; lastPrice: string }> };
+type OkxResponse<T> = { code: string; msg: string; data?: T };
+type OkxTicker = { instId: string; last: string };
+type OkxCandle = string[];
 
 async function getJson<T>(url: string): Promise<T> {
   const ctrl = new AbortController();
@@ -37,6 +41,12 @@ async function getBybit<T>(path: string): Promise<T> {
   const payload = await getJson<BybitResponse<T>>(`${BYBIT}${path}`);
   if (payload.retCode !== 0 || !payload.result) throw new Error(`Bybit ${payload.retCode}: ${payload.retMsg}`);
   return payload.result;
+}
+
+async function getOkx<T>(path: string): Promise<T> {
+  const payload = await getJson<OkxResponse<T>>(`${OKX}${path}`);
+  if (payload.code !== "0" || !payload.data) throw new Error(`OKX ${payload.code}: ${payload.msg}`);
+  return payload.data;
 }
 
 const binanceSource: MarketSource = {
@@ -63,16 +73,35 @@ const bybitSource: MarketSource = {
   },
 };
 
+const okxSource: MarketSource = {
+  venue: "OKX USDT swap",
+  tickers: async () => {
+    const tickers = await getOkx<OkxTicker[]>("/api/v5/market/tickers?instType=SWAP");
+    return tickers
+      .filter((ticker) => ticker.instId.endsWith("-USDT-SWAP"))
+      .map((ticker) => ({ symbol: `${ticker.instId.slice(0, -"-USDT-SWAP".length)}USDT`, lastPrice: ticker.last }));
+  },
+  bars: async (symbol, interval, limit) => {
+    const instId = `${symbol.slice(0, -"USDT".length)}-USDT-SWAP`;
+    const bar = interval === "4h" ? "4H" : "5m";
+    const candles = await getOkx<OkxCandle[]>(
+      `/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit}`,
+    );
+    // OKX returns newest-first; normalize to ascending and exclude the live candle.
+    return parseBars(candles.reverse()).slice(0, -1);
+  },
+};
+
 async function selectMarketSource(): Promise<{ source: MarketSource; tickers: Ticker[] }> {
-  try {
-    return { source: binanceSource, tickers: await binanceSource.tickers() };
-  } catch (binanceError) {
+  const failures: string[] = [];
+  for (const source of [binanceSource, bybitSource, okxSource]) {
     try {
-      return { source: bybitSource, tickers: await bybitSource.tickers() };
-    } catch (bybitError) {
-      throw new Error(`Market data unavailable: Binance=${String(binanceError)}; Bybit=${String(bybitError)}`);
+      return { source, tickers: await source.tickers() };
+    } catch (error) {
+      failures.push(`${source.venue}=${String(error)}`);
     }
   }
+  throw new Error(`Market data unavailable: ${failures.join("; ")}`);
 }
 
 function parseBars(raw: unknown): Candle[] {
