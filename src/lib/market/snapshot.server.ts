@@ -1,3 +1,4 @@
+import { persistenceAvailable } from "@/lib/db";
 import { UNIVERSE, displayTicker, type UniverseCoin } from "./universe";
 import type { Candle, CoinRow, Direction, ExecutionRow, MarketSnapshot } from "./types";
 import { calcAdx, logReturns, mean, meanPairwiseCorr, percentileRank, realizedVolAnn, smaSeries, stdev } from "./math";
@@ -88,7 +89,7 @@ function buildExecution(id: string, ticker: string, bars: Candle[]): ExecutionRo
 
 export async function buildSnapshot(): Promise<MarketSnapshot> {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
-    await persistMarketSnapshot(cache.data, []);
+    if (persistenceAvailable) await persistMarketSnapshot(cache.data, []);
     return cache.data;
   }
   const tickers = await getJson<Ticker[]>(`${BINANCE_FUTURES}/fapi/v1/ticker/price`);
@@ -151,7 +152,9 @@ export async function buildSnapshot(): Promise<MarketSnapshot> {
     ...rows.map((row) => ({ instrumentId: row.coin.id, timeframe: "4h" as const, bars: row.bars })),
     ...executionSeeds.map((row, index) => ({ instrumentId: row.coin.id, timeframe: "5m" as const, bars: fiveM[index] ?? [] })),
   ];
-  const persisted = await persistMarketSnapshot(data, rawBars);
-  data.consensus.stabilityBars = persisted.stabilityBars;
+  if (persistenceAvailable) {
+    const persisted = await persistMarketSnapshot(data, rawBars);
+    data.consensus.stabilityBars = persisted.stabilityBars;
+  }
   cache = { at: Date.now(), data }; return data;
 }

@@ -10,6 +10,19 @@ const rawDatabaseUrl =
 const databaseUrl =
   rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl : undefined;
 
+/** PGLite's WASM assets are unavailable in Vercel serverless functions. */
+export const databaseAvailable = Boolean(databaseUrl) || process.env.VERCEL !== "1";
+
+/**
+ * Persisted storage needs Neon (or another Postgres-compatible DATABASE_URL) on
+ * Vercel. Local development continues to use the in-memory PGLite fallback.
+ */
+export const persistenceAvailable = databaseAvailable;
+
+function unavailableDatabaseError(): Error {
+  return new Error("DATABASE_URL is required for persisted storage on Vercel.");
+}
+
 /**
  * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
  * sandbox), otherwise a local embedded **PGLite** (Postgres compiled to WASM) so
@@ -176,6 +189,7 @@ async function createSql(): Promise<Sql> {
         "or a server route loader, never from client code.",
     );
   }
+  if (!databaseAvailable) throw unavailableDatabaseError();
   return dbSource === "neon" ? createNeonSql() : createPgliteSql();
 }
 
@@ -224,15 +238,6 @@ export function ensureDbReady(): Promise<void> {
   return getSql().then(() => undefined);
 }
 
-// Server-only eager start: kick PGLite bootstrap as soon as this module loads in
-// Node. Client bundles never hit this path (`getSql` throws in the browser).
-const globalBoot = globalThis as typeof globalThis & {
-  __pgBootstrapPromise__?: Promise<void>;
-};
-if (typeof window === "undefined" && dbSource === "pglite") {
-  globalBoot.__pgBootstrapPromise__ ??= ensureDbReady().catch((err) => {
-    globalBoot.__pgBootstrapPromise__ = undefined;
-    console.error("[db] PGLite bootstrap failed:", err);
-    throw err;
-  });
-}
+// Do not bootstrap at module evaluation time. Serverless bundles may import this
+// module before their optional PGLite assets are available; callers initialize it
+// lazily through getSql(), where failures can be handled at the request boundary.

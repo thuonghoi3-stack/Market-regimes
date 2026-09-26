@@ -8,9 +8,11 @@ export const Route = createFileRoute("/api/v1/market/history")({
       GET: async () => {
         try {
           const { buildSnapshot } = await import("@/lib/market/snapshot.server");
-          const { loadMarketHistory } = await import("@/lib/market/persistence.server");
+          const { persistenceAvailable } = await import("@/lib/db");
           const snapshot = await buildSnapshot();
-          const persisted = await loadMarketHistory();
+          const persisted = persistenceAvailable
+            ? await (await import("@/lib/market/persistence.server")).loadMarketHistory()
+            : { snapshots: [], transitions: [] };
           return Response.json({ data: { ...historyData(snapshot), persisted }, meta: snapshotMeta(snapshot) });
         } catch {
           return snapshotErrorResponse();
