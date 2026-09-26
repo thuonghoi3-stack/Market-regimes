@@ -5,6 +5,7 @@ import { calcAdx, logReturns, mean, meanPairwiseCorr, percentileRank, realizedVo
 import { persistMarketSnapshot } from "./persistence.server";
 
 const BINANCE_FUTURES = "https://fapi.binance.com";
+const BYBIT = "https://api.bybit.com";
 const CACHE_TTL_MS = 60_000;
 const FOUR_H_LIMIT = 500;
 const FIVE_M_LIMIT = 320;
@@ -12,6 +13,15 @@ const EXECUTION_IDS = new Set(["BTC", "ETH", "SOL", "BNB", "LINK", "DOGE"]);
 let cache: { at: number; data: MarketSnapshot } | null = null;
 
 type Ticker = { symbol: string; lastPrice: string };
+type MarketSource = {
+  venue: string;
+  tickers: () => Promise<Ticker[]>;
+  bars: (symbol: string, interval: "4h" | "5m", limit: number) => Promise<Candle[]>;
+};
+
+type BybitResponse<T> = { retCode: number; retMsg: string; result?: T };
+type BybitKlines = { list?: string[][] };
+type BybitTickers = { list?: Array<{ symbol: string; lastPrice: string }> };
 
 async function getJson<T>(url: string): Promise<T> {
   const ctrl = new AbortController();
@@ -21,6 +31,48 @@ async function getJson<T>(url: string): Promise<T> {
     if (!res.ok) throw new Error(`Upstream ${res.status}`);
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
+}
+
+async function getBybit<T>(path: string): Promise<T> {
+  const payload = await getJson<BybitResponse<T>>(`${BYBIT}${path}`);
+  if (payload.retCode !== 0 || !payload.result) throw new Error(`Bybit ${payload.retCode}: ${payload.retMsg}`);
+  return payload.result;
+}
+
+const binanceSource: MarketSource = {
+  venue: "Binance USD-M",
+  tickers: () => getJson<Ticker[]>(`${BINANCE_FUTURES}/fapi/v1/ticker/price`),
+  bars: async (symbol, interval, limit) => parseBars(await getJson<unknown>(
+    `${BINANCE_FUTURES}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+  )).slice(0, -1),
+};
+
+const bybitSource: MarketSource = {
+  venue: "Bybit linear perpetual",
+  tickers: async () => {
+    const { list = [] } = await getBybit<BybitTickers>("/v5/market/tickers?category=linear");
+    return list;
+  },
+  bars: async (symbol, interval, limit) => {
+    const bybitInterval = interval === "4h" ? "240" : "5";
+    const { list = [] } = await getBybit<BybitKlines>(
+      `/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`,
+    );
+    // Bybit returns newest-first; normalize to ascending and exclude the live candle.
+    return parseBars(list.reverse()).slice(0, -1);
+  },
+};
+
+async function selectMarketSource(): Promise<{ source: MarketSource; tickers: Ticker[] }> {
+  try {
+    return { source: binanceSource, tickers: await binanceSource.tickers() };
+  } catch (binanceError) {
+    try {
+      return { source: bybitSource, tickers: await bybitSource.tickers() };
+    } catch (bybitError) {
+      throw new Error(`Market data unavailable: Binance=${String(binanceError)}; Bybit=${String(bybitError)}`);
+    }
+  }
 }
 
 function parseBars(raw: unknown): Candle[] {
@@ -92,12 +144,12 @@ export async function buildSnapshot(): Promise<MarketSnapshot> {
     if (persistenceAvailable) await persistMarketSnapshot(cache.data, []);
     return cache.data;
   }
-  const tickers = await getJson<Ticker[]>(`${BINANCE_FUTURES}/fapi/v1/ticker/price`);
+  const { source, tickers } = await selectMarketSource();
   const symbols = new Set(tickers.map((x) => x.symbol));
   const resolved = UNIVERSE.flatMap((coin) => { const symbol = symbolFor(coin, symbols); return symbol ? [{ coin, symbol }] : []; });
   const missing = UNIVERSE.filter((coin) => !resolved.some((x) => x.coin.id === coin.id)).map((coin) => coin.id);
   const fourH = await pooled(resolved, 10, async ({ symbol }) => {
-    try { return parseBars(await getJson<unknown>(`${BINANCE_FUTURES}/fapi/v1/klines?symbol=${symbol}&interval=4h&limit=${FOUR_H_LIMIT}`)).slice(0, -1); } catch { return []; }
+    try { return await source.bars(symbol, "4h", FOUR_H_LIMIT); } catch { return []; }
   });
   const usable = resolved.flatMap((row, i) => fourH[i]!.length >= 250 ? [{ ...row, bars: fourH[i]! }] : []);
   missing.push(...resolved.filter((_, i) => fourH[i]!.length < 250).map((x) => x.coin.id));
@@ -142,12 +194,12 @@ export async function buildSnapshot(): Promise<MarketSnapshot> {
   });
   const executionSeeds = features.filter((x) => EXECUTION_IDS.has(x.coin.id));
   const fiveM = await pooled(executionSeeds, 6, async (x) => {
-    try { return parseBars(await getJson<unknown>(`${BINANCE_FUTURES}/fapi/v1/klines?symbol=${x.symbol}&interval=5m&limit=${FIVE_M_LIMIT}`)).slice(0, -1); } catch { return []; }
+    try { return await source.bars(x.symbol, "5m", FIVE_M_LIMIT); } catch { return []; }
   });
   const execution = executionSeeds.flatMap((x, i) => fiveM[i]!.length >= 100 ? [buildExecution(x.coin.id, displayTicker(x.coin.id), fiveM[i]!)] : []);
   const axes = { direction, trendQuality: consensusStrength >= 0.7 ? "persistent" as const : consensusStrength >= 0.55 ? "developing" as const : "weak" as const, breadth: ema50Breadth >= 0.7 ? "broad" as const : ema50Breadth >= 0.5 ? "healthy" as const : "narrow" as const, volatility: volPercentile > 0.9 ? "extreme" as const : volPercentile > 0.7 ? "elevated" as const : volPercentile < 0.3 ? "compressed" as const : "normal" as const, correlation: corr > 0.6 ? "crowded" as const : corr < 0.3 ? "dispersed" as const : "normal" as const, positioning: "unknown" as const, stress };
   const recent = basket.slice(-90); const scale = recent[0] || 1;
-  const data: MarketSnapshot = { asOf: Date.now(), barCloseAt: rows[0]!.bars.at(-1)!.t + 4 * 60 * 60 * 1000, source: "Binance USD-M linear perpetual", venue: "Binance USD-M", universe: UNIVERSE.length, listed: rows.length, missing: [...new Set(missing)], modelVersion: "v2.0.0-prototype", axes, consensus: { directionalBreadth, maBreadth: mean([ema50Breadth, ema200Breadth]), sectorBreadth, trendBreadth, consensusStrength, eligible: rows.length, sectorsEligible: groups.length, sectorsAligned, agreement: consensusStrength, stabilityBars: 1, transitionRisk: mean([volPercentile, 1 - directionalBreadth]) }, kpis: { basketReturn20: basketRet20, basketReturn60: ret(basket, 60), btcReturn20: ret(btc, 20), altVsBtc20: basketRet20 - ret(btc, 20), ema50Breadth, ema200Breadth, trendBreadth, realizedVol20: vol, volPercentile, avgCorr20: corr, drawdown60: drawdown, avgFunding: null, dispersion20: stdev(features.map((x) => x.ret20)) }, series: { t: rows[0]!.bars.slice(-90).map((b) => b.t), basket: recent.map((x) => 100 * x / scale), btc: btcNorm.slice(-90), breadth: Array.from({ length: 90 }, (_, i) => mean(closes.map((c) => c[c.length - 90 + i]! > (smaSeries(c, 50)[c.length - 90 + i] ?? Infinity) ? 1 : 0))), vol: Array.from({ length: 90 }, () => volPercentile), direction: Array.from({ length: 90 }, () => direction) }, coins: cohorts.sort((a, b) => b.relative20 - a.relative20), execution };
+  const data: MarketSnapshot = { asOf: Date.now(), barCloseAt: rows[0]!.bars.at(-1)!.t + 4 * 60 * 60 * 1000, source: `${source.venue} perpetual`, venue: source.venue, universe: UNIVERSE.length, listed: rows.length, missing: [...new Set(missing)], modelVersion: "v2.0.0-prototype", axes, consensus: { directionalBreadth, maBreadth: mean([ema50Breadth, ema200Breadth]), sectorBreadth, trendBreadth, consensusStrength, eligible: rows.length, sectorsEligible: groups.length, sectorsAligned, agreement: consensusStrength, stabilityBars: 1, transitionRisk: mean([volPercentile, 1 - directionalBreadth]) }, kpis: { basketReturn20: basketRet20, basketReturn60: ret(basket, 60), btcReturn20: ret(btc, 20), altVsBtc20: basketRet20 - ret(btc, 20), ema50Breadth, ema200Breadth, trendBreadth, realizedVol20: vol, volPercentile, avgCorr20: corr, drawdown60: drawdown, avgFunding: null, dispersion20: stdev(features.map((x) => x.ret20)) }, series: { t: rows[0]!.bars.slice(-90).map((b) => b.t), basket: recent.map((x) => 100 * x / scale), btc: btcNorm.slice(-90), breadth: Array.from({ length: 90 }, (_, i) => mean(closes.map((c) => c[c.length - 90 + i]! > (smaSeries(c, 50)[c.length - 90 + i] ?? Infinity) ? 1 : 0))), vol: Array.from({ length: 90 }, () => volPercentile), direction: Array.from({ length: 90 }, () => direction) }, coins: cohorts.sort((a, b) => b.relative20 - a.relative20), execution };
   const rawBars = [
     ...rows.map((row) => ({ instrumentId: row.coin.id, timeframe: "4h" as const, bars: row.bars })),
     ...executionSeeds.map((row, index) => ({ instrumentId: row.coin.id, timeframe: "5m" as const, bars: fiveM[index] ?? [] })),
