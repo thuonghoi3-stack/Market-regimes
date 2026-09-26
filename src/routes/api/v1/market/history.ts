@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { historyData } from "@/lib/market/public-contracts";
-import { snapshotErrorResponse, snapshotResponse } from "@/lib/market/api-response.server";
+import { historyData, snapshotMeta } from "@/lib/market/public-contracts";
+import { snapshotErrorResponse } from "@/lib/market/api-response.server";
 
 export const Route = createFileRoute("/api/v1/market/history")({
   server: {
@@ -8,8 +8,10 @@ export const Route = createFileRoute("/api/v1/market/history")({
       GET: async () => {
         try {
           const { buildSnapshot } = await import("@/lib/market/snapshot.server");
+          const { loadMarketHistory } = await import("@/lib/market/persistence.server");
           const snapshot = await buildSnapshot();
-          return snapshotResponse(snapshot, historyData(snapshot));
+          const persisted = await loadMarketHistory();
+          return Response.json({ data: { ...historyData(snapshot), persisted }, meta: snapshotMeta(snapshot) });
         } catch {
           return snapshotErrorResponse();
         }

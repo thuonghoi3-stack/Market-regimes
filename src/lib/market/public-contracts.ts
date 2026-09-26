@@ -1,58 +1,25 @@
 import type { CoinRow, MarketSnapshot } from "./types";
 
 export type PublicApiMeta = {
-  apiVersion: "v1";
+  apiVersion: "v2";
   asOf: string;
-  source: string;
+  barCloseAt: string;
+  timeframe: "4h";
+  venue: string;
+  instrumentType: "linear_perpetual";
+  modelVersion: string;
   universe: number;
   listed: number;
   missing: string[];
 };
 
-export type PublicApiResponse<T> = {
-  data: T;
-  meta: PublicApiMeta;
-};
+export type PublicApiResponse<T> = { data: T; meta: PublicApiMeta };
 
 export function snapshotMeta(snapshot: MarketSnapshot): PublicApiMeta {
-  return {
-    apiVersion: "v1",
-    asOf: new Date(snapshot.asOf).toISOString(),
-    source: snapshot.source,
-    universe: snapshot.universe,
-    listed: snapshot.listed,
-    missing: snapshot.missing,
-  };
+  return { apiVersion: "v2", asOf: new Date(snapshot.asOf).toISOString(), barCloseAt: new Date(snapshot.barCloseAt).toISOString(), timeframe: "4h", venue: snapshot.venue, instrumentType: "linear_perpetual", modelVersion: snapshot.modelVersion, universe: snapshot.universe, listed: snapshot.listed, missing: snapshot.missing };
 }
 
-export function regimeData(snapshot: MarketSnapshot) {
-  return {
-    regime: snapshot.regime,
-    scores: snapshot.scores,
-  };
-}
-
-export function overviewData(snapshot: MarketSnapshot) {
-  return {
-    regime: {
-      id: snapshot.regime.id,
-      label: snapshot.regime.label,
-      labelVi: snapshot.regime.labelVi,
-      confidence: snapshot.regime.confidence,
-    },
-    scores: snapshot.scores,
-    kpis: snapshot.kpis,
-  };
-}
-
-export function assetsData(snapshot: MarketSnapshot): { items: CoinRow[] } {
-  return { items: snapshot.coins };
-}
-
-export function historyData(snapshot: MarketSnapshot) {
-  return {
-    interval: "1d" as const,
-    windowDays: snapshot.series.t.length,
-    series: snapshot.series,
-  };
-}
+export function regimeData(snapshot: MarketSnapshot) { return { axes: snapshot.axes, consensus: snapshot.consensus, kpis: snapshot.kpis }; }
+export function overviewData(snapshot: MarketSnapshot) { return { axes: snapshot.axes, consensus: snapshot.consensus, kpis: snapshot.kpis, execution: snapshot.execution }; }
+export function assetsData(snapshot: MarketSnapshot): { items: CoinRow[] } { return { items: snapshot.coins }; }
+export function historyData(snapshot: MarketSnapshot) { return { interval: "4h" as const, bars: snapshot.series.t.length, series: snapshot.series }; }

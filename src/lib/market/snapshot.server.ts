@@ -1,494 +1,157 @@
-import {
-  MAJOR_IDS,
-  MEME_IDS,
-  UNIVERSE,
-  displayTicker,
-  fundingCandidates,
-  spotCandidates,
-  type UniverseCoin,
-} from "./universe";
-import type {
-  Candle,
-  CoinRow,
-  MarketKpis,
-  MarketSnapshot,
-  MarketSeries,
-  RegimeId,
-  TrendTag,
-} from "./types";
-import {
-  alignCloses,
-  betaVs,
-  calcAdx,
-  clamp,
-  finite,
-  hurstExponent,
-  logReturns,
-  maxDrawdown,
-  mean,
-  meanPairwiseCorr,
-  parkinsonAnn,
-  percentileRank,
-  realizedVolAnn,
-  rollingVolSeries,
-  rsiWilder,
-  simpleReturn,
-  smaAt,
-  smaSeries,
-  stdev,
-} from "./math";
-import { buildScores, describeRegime } from "./regime";
+import { UNIVERSE, displayTicker, type UniverseCoin } from "./universe";
+import type { Candle, CoinRow, Direction, ExecutionRow, MarketSnapshot } from "./types";
+import { calcAdx, logReturns, mean, meanPairwiseCorr, percentileRank, realizedVolAnn, smaSeries, stdev } from "./math";
+import { persistMarketSnapshot } from "./persistence.server";
 
-const VISION = "https://data-api.binance.vision";
-const BITGET = "https://api.bitget.com";
-const KLINE_LIMIT = 180;
-const CACHE_TTL_MS = 45_000;
-const KLINE_TTL_MS = 8 * 60_000;
-const STALE_MS = 2 * 24 * 60 * 60 * 1000;
+const BINANCE_FUTURES = "https://fapi.binance.com";
+const CACHE_TTL_MS = 60_000;
+const FOUR_H_LIMIT = 500;
+const FIVE_M_LIMIT = 320;
+const EXECUTION_IDS = new Set(["BTC", "ETH", "SOL", "BNB", "LINK", "DOGE"]);
+let cache: { at: number; data: MarketSnapshot } | null = null;
 
-type Ticker = {
-  symbol: string;
-  lastPrice: number;
-  priceChangePercent: number;
-};
+type Ticker = { symbol: string; lastPrice: string };
 
-type CacheBox = { at: number; data: MarketSnapshot };
-let snapshotCache: CacheBox | null = null;
-const klineCache = new Map<string, { at: number; bars: Candle[] }>();
-
-async function getJson<T>(url: string, timeoutMs = 10_000): Promise<T> {
+async function getJson<T>(url: string): Promise<T> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const timer = setTimeout(() => ctrl.abort(), 12_000);
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`${url} ${res.status}`);
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`Upstream ${res.status}`);
     return (await res.json()) as T;
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
-async function mapPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, i: number) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const idx = next++;
-      out[idx] = await fn(items[idx]!, idx);
-    }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, () => worker()),
-  );
-  return out;
-}
-
-async function loadTickers(): Promise<Map<string, Ticker>> {
-  const raw = await getJson<
-    Array<{
-      symbol: string;
-      lastPrice: string;
-      priceChangePercent: string;
-    }>
-  >(`${VISION}/api/v3/ticker/24hr`, 12_000);
-  const map = new Map<string, Ticker>();
-  for (const row of raw) {
-    if (!row.symbol.endsWith("USDT")) continue;
-    map.set(row.symbol, {
-      symbol: row.symbol,
-      lastPrice: Number(row.lastPrice),
-      priceChangePercent: Number(row.priceChangePercent),
-    });
-  }
-  return map;
-}
-
-async function loadFunding(): Promise<Map<string, number>> {
-  try {
-    const raw = await getJson<{
-      data?: Array<{ symbol: string; fundingRate: string }>;
-    }>(`${BITGET}/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES`);
-    const map = new Map<string, number>();
-    for (const row of raw.data ?? []) {
-      const v = Number(row.fundingRate);
-      if (Number.isFinite(v)) map.set(row.symbol, v);
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function parseKlines(raw: unknown): Candle[] {
+function parseBars(raw: unknown): Candle[] {
   if (!Array.isArray(raw)) return [];
-  const bars: Candle[] = [];
-  for (const row of raw) {
-    if (!Array.isArray(row) || row.length < 6) continue;
-    const t = Number(row[0]);
-    const o = Number(row[1]);
-    const h = Number(row[2]);
-    const l = Number(row[3]);
-    const c = Number(row[4]);
-    const v = Number(row[5]);
-    if (![t, o, h, l, c].every(Number.isFinite)) continue;
-    bars.push({ t, o, h, l, c, v: finite(v) });
-  }
-  return bars;
+  return raw.flatMap((r): Candle[] => {
+    if (!Array.isArray(r) || r.length < 6) return [];
+    const [t, o, h, l, c, v] = r.map(Number);
+    return [t, o, h, l, c, v].every(Number.isFinite) ? [{ t, o, h, l, c, v }] : [];
+  });
 }
 
-async function loadKlines(symbol: string): Promise<Candle[]> {
-  const hit = klineCache.get(symbol);
-  if (hit && Date.now() - hit.at < KLINE_TTL_MS) return hit.bars;
-  const raw = await getJson<unknown>(
-    `${VISION}/api/v3/klines?symbol=${symbol}&interval=1d&limit=${KLINE_LIMIT}`,
-  );
-  const bars = parseKlines(raw);
-  if (bars.length) klineCache.set(symbol, { at: Date.now(), bars });
-  return bars;
+async function pooled<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const result: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) { const i = next++; result[i] = await fn(items[i]!); }
+  }));
+  return result;
 }
 
-function resolveSymbol(
-  coin: UniverseCoin,
-  tickers: Map<string, Ticker>,
-): string | null {
-  for (const s of spotCandidates(coin.id)) {
-    if (tickers.has(s)) return s;
-  }
-  return null;
+function symbolFor(coin: UniverseCoin, tickers: Set<string>): string | null {
+  const ids = coin.id === "MATIC" ? ["POL", "MATIC"] : coin.id.startsWith("1000") ? [coin.id, coin.id.slice(4)] : [coin.id];
+  return ids.map((id) => `${id}USDT`).find((symbol) => tickers.has(symbol)) ?? null;
 }
 
-function pickFunding(id: string, funding: Map<string, number>): number | null {
-  for (const s of fundingCandidates(id)) {
-    const v = funding.get(s);
-    if (v != null) return v;
-  }
-  return null;
+function ema(values: number[], n: number): number | null {
+  if (values.length < n) return null;
+  const alpha = 2 / (n + 1);
+  let value = values.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  for (const x of values.slice(n)) value = alpha * x + (1 - alpha) * value;
+  return value;
 }
 
-function trendTag(
-  above50: boolean,
-  adx: number,
-  plusDi: number,
-  minusDi: number,
-): TrendTag {
-  if (adx >= 18 && plusDi > minusDi && above50) return "up";
-  if (adx >= 18 && minusDi > plusDi && !above50) return "down";
-  return "range";
+function ret(values: number[], bars: number): number {
+  const prev = values.at(-1 - bars); const last = values.at(-1);
+  return prev && last ? last / prev - 1 : 0;
 }
 
-function equalWeightIndex(closeMatrix: number[][]): number[] {
-  const nCoins = closeMatrix.length;
-  const nDays = closeMatrix[0]?.length ?? 0;
-  const idx = new Array<number>(nDays).fill(100);
-  if (nCoins === 0 || nDays === 0) return idx;
-  for (let t = 1; t < nDays; t++) {
-    let r = 0;
-    let count = 0;
-    for (let i = 0; i < nCoins; i++) {
-      const prev = closeMatrix[i]![t - 1]!;
-      const cur = closeMatrix[i]![t]!;
-      if (prev > 0 && cur > 0 && Number.isFinite(prev) && Number.isFinite(cur)) {
-        r += cur / prev - 1;
-        count += 1;
-      }
-    }
-    const next = idx[t - 1]! * (1 + (count ? r / count : 0));
-    idx[t] = finite(next, idx[t - 1]!);
-  }
-  return idx;
+function classifyDirection(breadth: number, basketRet: number): Direction {
+  if (breadth >= 0.6 && basketRet > 0) return "bull";
+  if (breadth <= 0.4 && basketRet < 0) return "bear";
+  return "neutral";
 }
 
-function rollingScores(
-  ew: number[],
-  breadth: Array<number | null>,
-  vol: number[],
-  corr: number[],
-  volStart: number,
-): RegimeId[] {
-  const out: RegimeId[] = [];
-  const n = ew.length;
-  for (let i = 0; i < n; i++) {
-    const b = breadth[i] ?? 0.5;
-    const look = Math.min(30, i);
-    const eNow = ew[i]!;
-    const ePrev = ew[i - look] ?? eNow;
-    const mom = ePrev > 0 ? eNow / ePrev - 1 : 0;
-    const v = vol[Math.max(0, i - volStart)] ?? vol.at(-1) ?? 0.5;
-    const c = corr[i] ?? 0.4;
-    const trend = clamp(0.55 * Math.tanh(mom / 0.1) + 0.45 * (2 * b - 1), -1, 1);
-    let id: RegimeId = "transition";
-    if (v > 0.78 && trend < -0.15 && c > 0.52) id = "crisis";
-    else if (trend > 0.35 && v < 0.55 && b > 0.55) id = "expansion";
-    else if (trend > 0.28 && v >= 0.55) id = "euphoria";
-    else if (trend < -0.32) id = "risk_off";
-    else if (Math.abs(trend) < 0.22 && v < 0.4) id = "compression";
-    else if (trend > 0 && b < 0.45) id = "distribution";
-    out.push(id);
-  }
-  return out;
+function buildExecution(id: string, ticker: string, bars: Candle[]): ExecutionRow {
+  const closes = bars.map((b) => b.c); const last = closes.at(-1) ?? 0;
+  const ranges = bars.slice(-14).map((b) => b.h - b.l);
+  const atr = mean(ranges) || 1;
+  const atrSamples = bars.slice(14).map((_, i) => mean(bars.slice(i, i + 14).map((b) => b.h - b.l)));
+  const atrPct = percentileRank(atrSamples, atr);
+  const volBase = mean(bars.slice(-50, -1).map((b) => b.v)) || 1;
+  const relativeVolume = (bars.at(-1)?.v ?? 0) / volBase;
+  const session = bars.slice(-288);
+  const vwapDen = session.reduce((s, b) => s + b.v, 0) || 1;
+  const vwap = session.reduce((s, b) => s + ((b.h + b.l + b.c) / 3) * b.v, 0) / vwapDen;
+  const vwapDistanceAtr = (last - vwap) / atr;
+  const adx = calcAdx(bars, 14);
+  const priorHigh = Math.max(...bars.slice(-25, -1).map((b) => b.h));
+  const localStructure = last > priorHigh && relativeVolume > 1.2 ? "breakout" : adx.adx >= 20 && adx.plusDi > adx.minusDi ? "uptrend" : adx.adx >= 20 && adx.minusDi > adx.plusDi ? "downtrend" : "range";
+  const location = Math.abs(vwapDistanceAtr) <= 0.8 ? "value" : Math.abs(vwapDistanceAtr) > 2 ? "extended" : "mid_range";
+  const volatility = atrPct > 0.95 ? "shock" : atrPct > 0.75 ? "expanding" : atrPct < 0.25 ? "compressed" : "tradable";
+  const quality = volatility === "shock" || location === "extended" ? "avoid" : (relativeVolume >= 0.7 && volatility === "tradable") ? "clean" : "conditional";
+  const evidence = [`${localStructure} 5M`, `VWAP ${vwapDistanceAtr.toFixed(1)} ATR`, `RVOL ${relativeVolume.toFixed(1)}x`, `ATR pct ${(atrPct * 100).toFixed(0)}%`];
+  return { id, ticker, barCloseAt: bars.at(-1)!.t + 5 * 60 * 1000, localStructure, location, volatility, liquidity: relativeVolume < 0.35 ? "thin" : "good", quality, atrPercentile: atrPct, relativeVolume, vwapDistanceAtr, evidence };
 }
 
 export async function buildSnapshot(): Promise<MarketSnapshot> {
-  if (snapshotCache && Date.now() - snapshotCache.at < CACHE_TTL_MS) {
-    return snapshotCache.data;
+  if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
+    await persistMarketSnapshot(cache.data, []);
+    return cache.data;
   }
-
-  const [tickers, funding] = await Promise.all([loadTickers(), loadFunding()]);
-
-  const resolved: Array<{
-    coin: UniverseCoin;
-    symbol: string;
-    ticker: Ticker;
-  }> = [];
-  const missing: string[] = [];
-  for (const coin of UNIVERSE) {
-    const symbol = resolveSymbol(coin, tickers);
-    const ticker = symbol ? tickers.get(symbol) : undefined;
-    if (!symbol || !ticker) {
-      missing.push(coin.id);
-      continue;
-    }
-    resolved.push({ coin, symbol, ticker });
-  }
-
-  const klines = await mapPool(resolved, 12, async (row) => {
-    try {
-      const bars = await loadKlines(row.symbol);
-      const last = bars.at(-1);
-      if (last && row.ticker.lastPrice > 0) {
-        return [
-          ...bars.slice(0, -1),
-          { ...last, c: row.ticker.lastPrice },
-        ];
-      }
-      return bars;
-    } catch {
-      return [] as Candle[];
-    }
+  const tickers = await getJson<Ticker[]>(`${BINANCE_FUTURES}/fapi/v1/ticker/price`);
+  const symbols = new Set(tickers.map((x) => x.symbol));
+  const resolved = UNIVERSE.flatMap((coin) => { const symbol = symbolFor(coin, symbols); return symbol ? [{ coin, symbol }] : []; });
+  const missing = UNIVERSE.filter((coin) => !resolved.some((x) => x.coin.id === coin.id)).map((coin) => coin.id);
+  const fourH = await pooled(resolved, 10, async ({ symbol }) => {
+    try { return parseBars(await getJson<unknown>(`${BINANCE_FUTURES}/fapi/v1/klines?symbol=${symbol}&interval=4h&limit=${FOUR_H_LIMIT}`)).slice(0, -1); } catch { return []; }
   });
-
-  const usable: Array<{
-    coin: UniverseCoin;
-    symbol: string;
-    ticker: Ticker;
-    bars: Candle[];
-  }> = [];
-  for (let i = 0; i < resolved.length; i++) {
-    const bars = klines[i] ?? [];
-    const lastTs = bars.at(-1)?.t ?? 0;
-    if (bars.length < 40 || Date.now() - lastTs > STALE_MS) {
-      missing.push(resolved[i]!.coin.id);
-      continue;
-    }
-    usable.push({ ...resolved[i]!, bars });
-  }
-
-  if (usable.length < 8) {
-    throw new Error("Không lấy đủ dữ liệu nến để xác định regime.");
-  }
-
-  const aligned = alignCloses(usable.map((u) => u.bars));
-  const closeMatrix = aligned.closes;
-  const nDays = aligned.t.length;
-  const ew = equalWeightIndex(closeMatrix);
-  const btcIdx = usable.findIndex((u) => u.coin.id === "BTC");
-  const btcCloses = (btcIdx >= 0 ? usable[btcIdx]!.bars : usable[0]!.bars).map(
-    (b) => b.c,
-  );
-  const btcAligned =
-    btcIdx >= 0 && closeMatrix[btcIdx] ? closeMatrix[btcIdx]! : btcCloses;
-  const btcNorm: number[] = [];
-  const btc0 = btcAligned[0] || 1;
-  for (const c of btcAligned) btcNorm.push((100 * c) / btc0);
-
-  const retMatrix: number[][] = closeMatrix.map((row) => {
-    const r = new Array<number>(nDays).fill(0);
-    for (let t = 1; t < nDays; t++) {
-      const prev = row[t - 1]!;
-      const cur = row[t]!;
-      r[t] = prev > 0 ? Math.log(cur / prev) : 0;
-    }
-    return r;
+  const usable = resolved.flatMap((row, i) => fourH[i]!.length >= 250 ? [{ ...row, bars: fourH[i]! }] : []);
+  missing.push(...resolved.filter((_, i) => fourH[i]!.length < 250).map((x) => x.coin.id));
+  if (usable.length < 8) throw new Error("Không đủ 4H perpetual candles để tính regime.");
+  const common = Math.min(...usable.map((x) => x.bars.length));
+  const rows = usable.map((x) => ({ ...x, bars: x.bars.slice(-common) }));
+  const closes = rows.map((x) => x.bars.map((b) => b.c));
+  const returns = closes.map(logReturns);
+  const basket: number[] = [100];
+  for (let i = 1; i < common; i++) basket.push(basket[i - 1]! * (1 + mean(closes.map((c) => c[i]! / c[i - 1]! - 1))));
+  const btcIndex = rows.findIndex((x) => x.coin.id === "BTC");
+  const btc = closes[btcIndex >= 0 ? btcIndex : 0]!;
+  const btcNorm = btc.map((x) => 100 * x / btc[0]!);
+  const features = rows.map((row, i) => {
+    const c = closes[i]!; const e50 = ema(c, 50) ?? c.at(-1)!; const e200 = ema(c, 200) ?? c.at(-1)!; const adx = calcAdx(row.bars, 14);
+    const trend = c.at(-1)! > e50 && adx.plusDi > adx.minusDi ? "up" as const : c.at(-1)! < e50 && adx.minusDi > adx.plusDi ? "down" as const : "range" as const;
+    return { ...row, closes: c, e50, e200, adx, trend, ret4h: ret(c, 1), ret20: ret(c, 20), ret60: ret(c, 60) };
   });
-
-  const sma50ByCoin = closeMatrix.map((row) => smaSeries(row, 50));
-  const breadthSma50: number[] = aligned.t.map((_, t) => {
-    let n = 0;
-    let hit = 0;
-    for (let i = 0; i < closeMatrix.length; i++) {
-      const sma = sma50ByCoin[i]![t];
-      const px = closeMatrix[i]![t];
-      if (sma != null && sma > 0 && px != null) {
-        n += 1;
-        if (px > sma) hit += 1;
-      }
-    }
-    return n ? hit / n : 0.5;
+  const ema50Breadth = mean(features.map((x) => x.closes.at(-1)! > x.e50 ? 1 : 0));
+  const ema200Breadth = mean(features.map((x) => x.closes.at(-1)! > x.e200 ? 1 : 0));
+  const basketRet20 = ret(basket, 20); const direction = classifyDirection(ema50Breadth, basketRet20);
+  const directionalBreadth = mean(features.map((x) => direction === "bull" ? x.trend === "up" ? 1 : 0 : direction === "bear" ? x.trend === "down" ? 1 : 0 : x.trend === "range" ? 1 : 0));
+  const groups = [...new Set(features.map((x) => x.coin.group))];
+  const sectorsAligned = groups.filter((group) => {
+    const section = features.filter((x) => x.coin.group === group);
+    return mean(section.map((x) => direction === "bull" ? x.trend === "up" ? 1 : 0 : direction === "bear" ? x.trend === "down" ? 1 : 0 : x.trend === "range" ? 1 : 0)) >= 0.5;
+  }).length;
+  const sectorBreadth = sectorsAligned / groups.length;
+  const trendBreadth = mean(features.map((x) => x.adx.adx >= 18 && (direction === "bull" ? x.adx.plusDi > x.adx.minusDi : direction === "bear" ? x.adx.minusDi > x.adx.plusDi : true) ? 1 : 0));
+  const consensusStrength = mean([directionalBreadth, ema50Breadth, sectorBreadth, trendBreadth]);
+  const basketRets = logReturns(basket); const vol = realizedVolAnn(basketRets, 20);
+  const rollingVol = basketRets.slice(20).map((_, i) => realizedVolAnn(basketRets.slice(i, i + 20), 20));
+  const volPercentile = percentileRank(rollingVol, vol);
+  const corr = meanPairwiseCorr(returns, returns[0]!.length - 20, 20);
+  const peak = Math.max(...basket.slice(-60)); const drawdown = basket.at(-1)! / peak - 1;
+  const stress: "none" | "rising" | "high" = volPercentile > 0.9 && corr > 0.55 ? "high" : volPercentile > 0.75 || drawdown < -0.1 ? "rising" : "none";
+  const cohorts: CoinRow[] = features.map((x) => {
+    const relative20 = x.ret20 - basketRet20; const relative60 = x.ret60 - ret(basket, 60);
+    const strong = relative20 > 0.06 && x.trend === "up"; const weak = relative20 < -0.06 && x.trend === "down";
+    const cohort = strong && direction === "bull" ? "market_leader" : strong && direction !== "bull" ? "positive_divergence" : weak && direction === "bull" ? "negative_divergence" : Math.abs(relative20) > 0.1 ? "sector_outlier" : "market_aligned";
+    return { id: x.coin.id, ticker: displayTicker(x.coin.id), symbol: x.symbol, group: x.coin.group, price: x.closes.at(-1)!, ret4h: x.ret4h, ret20: x.ret20, relative20, relative60, ema50Dist: x.closes.at(-1)! / x.e50 - 1, ema200Dist: x.closes.at(-1)! / x.e200 - 1, adx14: x.adx.adx, trend: x.trend, funding: null, cohort, persistenceBars: strong || weak ? 1 : 0 };
   });
-
-  const ewRets = logReturns(ew);
-  const volSeries = rollingVolSeries(ewRets, 20);
-  const corr20: number[] = aligned.t.map(() => 0);
-  const corrLook = 20;
-  for (let t = corrLook; t < nDays; t++) {
-    corr20[t] = meanPairwiseCorr(retMatrix, t - corrLook + 1, corrLook);
-  }
-  let lastCorr = 0;
-  for (let t = 0; t < nDays; t++) {
-    if (corr20[t]) lastCorr = corr20[t]!;
-    else corr20[t] = lastCorr;
-  }
-
-  const volStart = nDays - volSeries.length;
-  const padVol = Array.from({ length: nDays }, (_, i) => {
-    const v = volSeries[i - volStart];
-    return v ?? volSeries[0] ?? 0;
+  const executionSeeds = features.filter((x) => EXECUTION_IDS.has(x.coin.id));
+  const fiveM = await pooled(executionSeeds, 6, async (x) => {
+    try { return parseBars(await getJson<unknown>(`${BINANCE_FUTURES}/fapi/v1/klines?symbol=${x.symbol}&interval=5m&limit=${FIVE_M_LIMIT}`)).slice(0, -1); } catch { return []; }
   });
-
-  const btcRets = logReturns(btcCloses);
-  const ew20 = simpleReturn(ew, Math.min(20, ew.length - 1));
-
-  const coins: CoinRow[] = usable.map((u) => {
-    const closes = u.bars.map((b) => b.c);
-    const rets = logReturns(closes);
-    const sma20 = smaAt(closes, 20);
-    const sma50 = smaAt(closes, 50);
-    const sma100 = smaAt(closes, 100);
-    const last = closes.at(-1) ?? u.ticker.lastPrice;
-    const adx = calcAdx(u.bars, 14);
-    const above50 = sma50 != null && last > sma50;
-    const slice20 = u.bars.slice(-20);
-    const hi20 = Math.max(...slice20.map((b) => b.h));
-    const lo20 = Math.min(...slice20.map((b) => b.l));
-    const chg7d = simpleReturn(closes, 7);
-    const btc7 = simpleReturn(btcCloses, 7);
-    return {
-      id: u.coin.id,
-      ticker: displayTicker(u.coin.id),
-      ccxt: u.coin.ccxt,
-      symbol: u.symbol,
-      group: u.coin.group,
-      price: last,
-      chg1d: simpleReturn(closes, 1),
-      chg7d,
-      chg30d: simpleReturn(closes, 30),
-      vsBtc7d: chg7d - btc7,
-      rsi14: rsiWilder(closes, 14),
-      sma20Dist: sma20 ? last / sma20 - 1 : 0,
-      sma50Dist: sma50 ? last / sma50 - 1 : 0,
-      sma100Dist: sma100 ? last / sma100 - 1 : 0,
-      aboveSma20: sma20 != null && last > sma20,
-      aboveSma50: above50,
-      aboveSma100: sma100 != null && last > sma100,
-      vol20d: realizedVolAnn(rets, 20),
-      beta60: betaVs(rets, btcRets),
-      adx14: adx.adx,
-      plusDi: adx.plusDi,
-      minusDi: adx.minusDi,
-      trend: trendTag(above50, adx.adx, adx.plusDi, adx.minusDi),
-      new20High: last >= hi20 * 0.999,
-      new20Low: last <= lo20 * 1.001,
-      funding: pickFunding(u.coin.id, funding),
-    };
-  });
-
-  const n = coins.length;
-  const pct = (pred: (c: CoinRow) => boolean) =>
-    n ? coins.filter(pred).length / n : 0;
-
-  const fundingVals = coins
-    .map((c) => c.funding)
-    .filter((v): v is number => v != null);
-  const meme = coins.filter((c) => MEME_IDS.has(c.id));
-  const majors = coins.filter((c) => MAJOR_IDS.has(c.id));
-
-  const kpis: MarketKpis = {
-    ew1d: simpleReturn(ew, 1),
-    ew7d: simpleReturn(ew, 7),
-    ew30d: simpleReturn(ew, 30),
-    btc1d: simpleReturn(btcCloses, 1),
-    btc7d: simpleReturn(btcCloses, 7),
-    btc30d: simpleReturn(btcCloses, 30),
-    altVsBtc20: ew20 - simpleReturn(btcCloses, Math.min(20, btcCloses.length - 1)),
-    ew20,
-    memeVsMajors7:
-      (meme.length ? mean(meme.map((c) => c.chg7d)) : 0) -
-      (majors.length ? mean(majors.map((c) => c.chg7d)) : 0),
-    pctAboveSma20: pct((c) => c.aboveSma20),
-    pctAboveSma50: pct((c) => c.aboveSma50),
-    pctAboveSma100: pct((c) => c.aboveSma100),
-    adv1d: coins.filter((c) => c.chg1d > 0).length,
-    dec1d: coins.filter((c) => c.chg1d < 0).length,
-    new20Highs: coins.filter((c) => c.new20High).length,
-    new20Lows: coins.filter((c) => c.new20Low).length,
-    realizedVol20: realizedVolAnn(ewRets, 20),
-    parkinsonVol20: parkinsonAnn(
-      // synthetic EW high/low is not available; use mean Parkinson of members
-      usable[btcIdx >= 0 ? btcIdx : 0]!.bars,
-      20,
-    ),
-    volPercentile: percentileRank(volSeries, volSeries.at(-1) ?? 0),
-    avgCorr20: corr20.at(-1) ?? 0,
-    avgFunding: fundingVals.length ? mean(fundingVals) : null,
-    adx: mean(coins.map((c) => c.adx14)),
-    hurst: hurstExponent(ewRets.slice(-90)),
-    dispersion20: stdev(coins.map((c) => c.chg7d)),
-    drawdown60: maxDrawdown(ew, 60),
-    pctUptrend: pct((c) => c.trend === "up"),
-    pctRsiHot: pct((c) => c.rsi14 >= 70),
-    pctRsiCold: pct((c) => c.rsi14 <= 30),
-  };
-
-  // Better Parkinson: average across coins
-  kpis.parkinsonVol20 = mean(
-    usable.map((u) => parkinsonAnn(u.bars, 20)),
-  );
-
-  const scores = buildScores(kpis);
-  const regime = describeRegime(scores, kpis);
-
-  const sliceFrom = Math.max(0, nDays - 90);
-  const series: MarketSeries = {
-    t: aligned.t.slice(sliceFrom),
-    ew: ew.slice(sliceFrom),
-    btc: btcNorm.slice(sliceFrom),
-    breadthSma50: breadthSma50.slice(sliceFrom),
-    vol20: padVol.slice(sliceFrom),
-    corr20: corr20.slice(sliceFrom),
-    regime: rollingScores(ew, breadthSma50, padVol, corr20, 0).slice(sliceFrom),
-  };
-
-  // Recompute historical vol percentile series for the chart (0-1)
-  const volPctSeries = padVol.map((v) => percentileRank(volSeries, v));
-  series.vol20 = volPctSeries.slice(sliceFrom);
-  series.regime = rollingScores(
-    ew,
-    breadthSma50,
-    volPctSeries,
-    corr20,
-    0,
-  ).slice(sliceFrom);
-
-  const data: MarketSnapshot = {
-    asOf: Date.now(),
-    source: "Binance · Bitget funding",
-    universe: UNIVERSE.length,
-    listed: coins.length,
-    missing: [...new Set(missing)],
-    regime,
-    scores,
-    kpis,
-    series,
-    coins: coins.sort((a, b) => a.ticker.localeCompare(b.ticker)),
-  };
-
-  snapshotCache = { at: Date.now(), data };
-  return data;
+  const execution = executionSeeds.flatMap((x, i) => fiveM[i]!.length >= 100 ? [buildExecution(x.coin.id, displayTicker(x.coin.id), fiveM[i]!)] : []);
+  const axes = { direction, trendQuality: consensusStrength >= 0.7 ? "persistent" as const : consensusStrength >= 0.55 ? "developing" as const : "weak" as const, breadth: ema50Breadth >= 0.7 ? "broad" as const : ema50Breadth >= 0.5 ? "healthy" as const : "narrow" as const, volatility: volPercentile > 0.9 ? "extreme" as const : volPercentile > 0.7 ? "elevated" as const : volPercentile < 0.3 ? "compressed" as const : "normal" as const, correlation: corr > 0.6 ? "crowded" as const : corr < 0.3 ? "dispersed" as const : "normal" as const, positioning: "unknown" as const, stress };
+  const recent = basket.slice(-90); const scale = recent[0] || 1;
+  const data: MarketSnapshot = { asOf: Date.now(), barCloseAt: rows[0]!.bars.at(-1)!.t + 4 * 60 * 60 * 1000, source: "Binance USD-M linear perpetual", venue: "Binance USD-M", universe: UNIVERSE.length, listed: rows.length, missing: [...new Set(missing)], modelVersion: "v2.0.0-prototype", axes, consensus: { directionalBreadth, maBreadth: mean([ema50Breadth, ema200Breadth]), sectorBreadth, trendBreadth, consensusStrength, eligible: rows.length, sectorsEligible: groups.length, sectorsAligned, agreement: consensusStrength, stabilityBars: 1, transitionRisk: mean([volPercentile, 1 - directionalBreadth]) }, kpis: { basketReturn20: basketRet20, basketReturn60: ret(basket, 60), btcReturn20: ret(btc, 20), altVsBtc20: basketRet20 - ret(btc, 20), ema50Breadth, ema200Breadth, trendBreadth, realizedVol20: vol, volPercentile, avgCorr20: corr, drawdown60: drawdown, avgFunding: null, dispersion20: stdev(features.map((x) => x.ret20)) }, series: { t: rows[0]!.bars.slice(-90).map((b) => b.t), basket: recent.map((x) => 100 * x / scale), btc: btcNorm.slice(-90), breadth: Array.from({ length: 90 }, (_, i) => mean(closes.map((c) => c[c.length - 90 + i]! > (smaSeries(c, 50)[c.length - 90 + i] ?? Infinity) ? 1 : 0))), vol: Array.from({ length: 90 }, () => volPercentile), direction: Array.from({ length: 90 }, () => direction) }, coins: cohorts.sort((a, b) => b.relative20 - a.relative20), execution };
+  const rawBars = [
+    ...rows.map((row) => ({ instrumentId: row.coin.id, timeframe: "4h" as const, bars: row.bars })),
+    ...executionSeeds.map((row, index) => ({ instrumentId: row.coin.id, timeframe: "5m" as const, bars: fiveM[index] ?? [] })),
+  ];
+  const persisted = await persistMarketSnapshot(data, rawBars);
+  data.consensus.stabilityBars = persisted.stabilityBars;
+  cache = { at: Date.now(), data }; return data;
 }

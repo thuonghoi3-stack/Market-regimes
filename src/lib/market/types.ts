@@ -1,130 +1,105 @@
 import type { CoinGroup } from "./universe";
 
-export type Candle = {
-  t: number;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
+export type Candle = { t: number; o: number; h: number; l: number; c: number; v: number };
+export type Direction = "bull" | "neutral" | "bear";
+export type TrendQuality = "weak" | "developing" | "persistent";
+export type BreadthState = "narrow" | "healthy" | "broad";
+export type VolatilityState = "compressed" | "normal" | "elevated" | "extreme";
+export type CorrelationState = "dispersed" | "normal" | "crowded";
+export type StressState = "none" | "rising" | "high";
+export type ExecutionQuality = "clean" | "conditional" | "avoid";
+export type LocalStructure = "uptrend" | "downtrend" | "range" | "breakout" | "reversal";
+export type LocationState = "value" | "mid_range" | "extended";
+
+export type MarketAxes = {
+  direction: Direction;
+  trendQuality: TrendQuality;
+  breadth: BreadthState;
+  volatility: VolatilityState;
+  correlation: CorrelationState;
+  positioning: "light" | "balanced" | "crowded" | "unknown";
+  stress: StressState;
 };
 
-export type TrendTag = "up" | "down" | "range";
+export type Consensus = {
+  directionalBreadth: number;
+  maBreadth: number;
+  sectorBreadth: number;
+  trendBreadth: number;
+  consensusStrength: number;
+  eligible: number;
+  sectorsEligible: number;
+  sectorsAligned: number;
+  agreement: number;
+  stabilityBars: number;
+  transitionRisk: number;
+};
 
-export type RegimeId =
-  | "expansion"
-  | "euphoria"
-  | "compression"
-  | "distribution"
-  | "transition"
-  | "risk_off"
-  | "crisis";
+export type MarketKpis = {
+  basketReturn20: number;
+  basketReturn60: number;
+  btcReturn20: number;
+  altVsBtc20: number;
+  ema50Breadth: number;
+  ema200Breadth: number;
+  trendBreadth: number;
+  realizedVol20: number;
+  volPercentile: number;
+  avgCorr20: number;
+  drawdown60: number;
+  avgFunding: number | null;
+  dispersion20: number;
+};
 
 export type CoinRow = {
   id: string;
   ticker: string;
-  ccxt: string;
   symbol: string;
   group: CoinGroup;
   price: number;
-  chg1d: number;
-  chg7d: number;
-  chg30d: number;
-  vsBtc7d: number;
-  rsi14: number;
-  sma20Dist: number;
-  sma50Dist: number;
-  sma100Dist: number;
-  aboveSma20: boolean;
-  aboveSma50: boolean;
-  aboveSma100: boolean;
-  vol20d: number;
-  beta60: number;
+  ret4h: number;
+  ret20: number;
+  relative20: number;
+  relative60: number;
+  ema50Dist: number;
+  ema200Dist: number;
   adx14: number;
-  plusDi: number;
-  minusDi: number;
-  trend: TrendTag;
-  new20High: boolean;
-  new20Low: boolean;
+  trend: "up" | "down" | "range";
   funding: number | null;
+  cohort: "market_leader" | "emerging_leader" | "positive_divergence" | "negative_divergence" | "sector_outlier" | "unconfirmed_outlier" | "market_aligned";
+  persistenceBars: number;
 };
 
-export type RegimeDriver = {
-  key: string;
-  label: string;
-  value: string;
-  hint: string;
-  polarity: "pos" | "neg" | "neu";
+export type ExecutionRow = {
+  id: string;
+  ticker: string;
+  barCloseAt: number;
+  localStructure: LocalStructure;
+  location: LocationState;
+  volatility: "compressed" | "tradable" | "expanding" | "shock";
+  liquidity: "good" | "thin" | "unknown";
+  quality: ExecutionQuality;
+  atrPercentile: number;
+  relativeVolume: number;
+  vwapDistanceAtr: number;
+  evidence: string[];
 };
 
-export type RegimeInfo = {
-  id: RegimeId;
-  label: string;
-  labelVi: string;
-  thesis: string;
-  playbook: string[];
-  confidence: number;
-  drivers: RegimeDriver[];
-};
-
-export type MarketScores = {
-  trend: number;
-  vol: number;
-  breadth: number;
-  corr: number;
-  crowding: number;
-};
-
-export type MarketKpis = {
-  ew1d: number;
-  ew7d: number;
-  ew30d: number;
-  btc1d: number;
-  btc7d: number;
-  btc30d: number;
-  altVsBtc20: number;
-  ew20: number;
-  memeVsMajors7: number;
-  pctAboveSma20: number;
-  pctAboveSma50: number;
-  pctAboveSma100: number;
-  adv1d: number;
-  dec1d: number;
-  new20Highs: number;
-  new20Lows: number;
-  realizedVol20: number;
-  parkinsonVol20: number;
-  volPercentile: number;
-  avgCorr20: number;
-  avgFunding: number | null;
-  adx: number;
-  hurst: number;
-  dispersion20: number;
-  drawdown60: number;
-  pctUptrend: number;
-  pctRsiHot: number;
-  pctRsiCold: number;
-};
-
-export type MarketSeries = {
-  t: number[];
-  ew: number[];
-  btc: number[];
-  breadthSma50: number[];
-  vol20: number[];
-  corr20: number[];
-  regime: RegimeId[];
-};
+export type MarketSeries = { t: number[]; basket: number[]; btc: number[]; breadth: number[]; vol: number[]; direction: Direction[] };
 
 export type MarketSnapshot = {
   asOf: number;
+  barCloseAt: number;
   source: string;
+  venue: string;
   universe: number;
   listed: number;
   missing: string[];
-  regime: RegimeInfo;
-  scores: MarketScores;
+  modelVersion: string;
+  axes: MarketAxes;
+  consensus: Consensus;
   kpis: MarketKpis;
   series: MarketSeries;
   coins: CoinRow[];
+  execution: ExecutionRow[];
 };
